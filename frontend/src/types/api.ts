@@ -27,6 +27,7 @@ export interface Product {
   colors: ProductColor[];
   sizes: string[];
   asset_2d_overlay: string;
+  asset_3d_model?: string | null;
   asset_thumbnail: string;
   in_stock: boolean;
 }

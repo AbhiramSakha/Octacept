@@ -70,8 +70,8 @@ export function useTryOn(): UseTryOnReturn {
       // ── Step 1: Capture ───────────────────────────────────────────────
       setState('capturing');
 
-      // Small delay to let the UI render the "capturing" state
-      await new Promise((r) => setTimeout(r, 300));
+      // Give the capturing state a brief render window before taking the frame.
+      await new Promise((r) => setTimeout(r, 80));
 
       const personImageB64 = captureFrame();
       if (!personImageB64) {

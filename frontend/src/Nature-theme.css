@@ -1,0 +1,192 @@
+/**
+ * MIRAI — Nature Theme
+ * Place at: frontend/src/styles/nature-theme.css
+ * Import ONCE in frontend/src/main.tsx:   import './styles/nature-theme.css';
+ *
+ * Works alongside Tailwind (layout utilities) with no tailwind.config changes.
+ * Fonts use local fallbacks only, so the mirror stays fully offline.
+ */
+
+:root {
+  /* Forest night base */
+  --n-bg: #0b1610;
+  --n-bg-2: #102019;
+  --n-surface: rgba(16, 33, 24, 0.74);
+  --n-surface-strong: rgba(11, 24, 17, 0.92);
+  --n-border: rgba(196, 222, 170, 0.14);
+  --n-border-strong: rgba(196, 222, 170, 0.30);
+
+  /* Text */
+  --n-text: #eef3e6;
+  --n-muted: #9db3a0;
+  --n-faint: #6e8573;
+
+  /* Nature accents */
+  --n-leaf: #a8c66c;
+  --n-leaf-strong: #7fa84a;
+  --n-leaf-ink: #10200f;
+  --n-sun: #e8b45a;
+  --n-water: #6fb7b0;
+  --n-clay: #d2805f;
+
+  --n-radius: 18px;
+}
+
+.nt-root {
+  background:
+    radial-gradient(90% 60% at 50% 0%, rgba(127, 168, 74, 0.10), transparent 70%),
+    var(--n-bg);
+  color: var(--n-text);
+}
+
+/* ── Typography ─────────────────────────────────────────────────────────── */
+.nt-font-display {
+  font-family: 'Fraunces', 'Cormorant Garamond', Georgia, 'Times New Roman', serif;
+}
+.nt-muted { color: var(--n-muted); }
+.nt-faint { color: var(--n-faint); }
+.nt-text { color: var(--n-text); }
+.nt-leaf-text { color: var(--n-leaf); }
+.nt-sun-text { color: var(--n-sun); }
+.nt-water-text { color: var(--n-water); }
+.nt-clay-text { color: var(--n-clay); }
+
+/* ── Surfaces ───────────────────────────────────────────────────────────── */
+.nt-glass {
+  background: var(--n-surface);
+  border: 1px solid var(--n-border);
+  border-radius: var(--n-radius);
+  backdrop-filter: blur(18px) saturate(1.15);
+  -webkit-backdrop-filter: blur(18px) saturate(1.15);
+  box-shadow: 0 18px 50px -18px rgba(0, 0, 0, 0.65), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+.nt-glass-strong {
+  background: var(--n-surface-strong);
+  border: 1px solid var(--n-border-strong);
+  border-radius: var(--n-radius);
+  backdrop-filter: blur(22px) saturate(1.2);
+  -webkit-backdrop-filter: blur(22px) saturate(1.2);
+  box-shadow: 0 24px 70px -20px rgba(0, 0, 0, 0.75);
+}
+.nt-panel {
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid var(--n-border);
+  border-radius: 14px;
+}
+
+/* Soft forest vignette over the live camera (edges only, keeps skin tones true) */
+.nt-vignette {
+  pointer-events: none;
+  background:
+    linear-gradient(to bottom, rgba(8, 20, 12, 0.55), transparent 22%),
+    radial-gradient(125% 95% at 50% 42%, transparent 58%, rgba(8, 20, 12, 0.55) 100%);
+}
+
+/* ── Chips / pills ──────────────────────────────────────────────────────── */
+.nt-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.3rem 0.8rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  line-height: 1.1;
+  color: var(--n-muted);
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid var(--n-border);
+  transition: all 0.2s ease;
+  white-space: nowrap;
+}
+button.nt-chip { cursor: pointer; }
+button.nt-chip:hover {
+  color: var(--n-text);
+  background: rgba(168, 198, 108, 0.12);
+  border-color: rgba(168, 198, 108, 0.38);
+}
+button.nt-chip:active { transform: scale(0.96); }
+
+.nt-chip--leaf  { color: var(--n-leaf);  background: rgba(168, 198, 108, 0.13); border-color: rgba(168, 198, 108, 0.42); }
+.nt-chip--sun   { color: var(--n-sun);   background: rgba(232, 180, 90, 0.13);  border-color: rgba(232, 180, 90, 0.42); }
+.nt-chip--water { color: var(--n-water); background: rgba(111, 183, 176, 0.13); border-color: rgba(111, 183, 176, 0.42); }
+.nt-chip--clay  { color: var(--n-clay);  background: rgba(210, 128, 95, 0.13);  border-color: rgba(210, 128, 95, 0.42); }
+button.nt-chip--clay:hover { color: #f3c1ac; }
+
+.nt-mono { font-family: ui-monospace, 'JetBrains Mono', 'Cascadia Mono', Consolas, monospace; }
+
+.nt-logo {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 10px;
+  color: var(--n-leaf-ink);
+  background: linear-gradient(135deg, #c3dd8a, #7fa84a);
+  box-shadow: 0 6px 18px -6px rgba(127, 168, 74, 0.8);
+}
+
+/* ── Buttons ────────────────────────────────────────────────────────────── */
+.nt-btn-primary,
+.nt-btn-ghost,
+.nt-btn-sun {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0.75rem 1.25rem;
+  border-radius: 14px;
+  font-size: 0.875rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  transition: transform 0.15s ease, box-shadow 0.2s ease, background 0.2s ease;
+}
+.nt-btn-primary {
+  color: var(--n-leaf-ink);
+  background: linear-gradient(135deg, #bcd882, #7fa84a);
+  box-shadow: 0 10px 26px -10px rgba(127, 168, 74, 0.85);
+}
+.nt-btn-primary:hover { box-shadow: 0 14px 32px -10px rgba(168, 198, 108, 0.9); transform: translateY(-1px); }
+.nt-btn-primary:active { transform: scale(0.97); }
+
+.nt-btn-ghost {
+  color: var(--n-text);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--n-border);
+}
+.nt-btn-ghost:hover { background: rgba(168, 198, 108, 0.12); border-color: rgba(168, 198, 108, 0.38); }
+.nt-btn-ghost:active { transform: scale(0.97); }
+
+.nt-btn-sun {
+  color: #2a1d06;
+  background: linear-gradient(135deg, #f1c97c, #e0a345);
+  box-shadow: 0 10px 26px -10px rgba(232, 180, 90, 0.8);
+}
+.nt-btn-sun:hover { transform: translateY(-1px); }
+.nt-btn-sun:active { transform: scale(0.97); }
+
+/* ── Status dot + breathing glow (used for "ACTIVE" states) ─────────────── */
+.nt-dot { width: 8px; height: 8px; border-radius: 999px; background: var(--n-faint); }
+.nt-dot--live { background: var(--n-leaf); box-shadow: 0 0 10px var(--n-leaf); }
+
+@keyframes nt-breathe {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(168, 198, 108, 0.0); }
+  50%      { box-shadow: 0 0 18px 2px rgba(168, 198, 108, 0.28); }
+}
+.nt-breathe { animation: nt-breathe 3.2s ease-in-out infinite; }
+
+@keyframes nt-sway {
+  0%, 100% { transform: rotate(-4deg); }
+  50%      { transform: rotate(4deg); }
+}
+.nt-sway { animation: nt-sway 3.6s ease-in-out infinite; transform-origin: 50% 90%; }
+
+@media (prefers-reduced-motion: reduce) {
+  .nt-breathe, .nt-sway { animation: none; }
+}
+
+/* ── Scrollbars ─────────────────────────────────────────────────────────── */
+.nt-scroll { scrollbar-width: thin; scrollbar-color: rgba(168, 198, 108, 0.35) transparent; }
+.nt-scroll::-webkit-scrollbar { width: 6px; height: 6px; }
+.nt-scroll::-webkit-scrollbar-thumb { background: rgba(168, 198, 108, 0.35); border-radius: 999px; }

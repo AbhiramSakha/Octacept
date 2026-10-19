@@ -19,7 +19,7 @@
 import { createDecartClient, models } from '@decartai/sdk';
 import type { RealTimeClient } from '@decartai/sdk';
 import type {
-  ILiveVTOProvider,
+  IVTOProvider,
   GarmentReference,
   VTOConnectionState,
   VTOQualityReport,
@@ -32,10 +32,13 @@ export interface DecartProviderOptions {
   speed?: 'fast';
 }
 
-export class DecartLucyVTOProvider implements ILiveVTOProvider {
-  readonly id = 'decart_lucy_vton';
+export class DecartLucyVTOProvider implements IVTOProvider {
+  readonly id = 'decart';
   readonly name = 'Decart Lucy V-TON';
   readonly modelName = 'lucy-vton-3.5';
+  readonly isTemporaryPrototype = true;
+  readonly renderMode = 'stream' as const;
+  readonly description = 'Temporary external VTO inference provider for prototype validation';
 
   private apiKey: string | null = null;
   private proxy: string | null = null;
@@ -76,10 +79,26 @@ export class DecartLucyVTOProvider implements ILiveVTOProvider {
   }
 
   async connect(cameraStream: MediaStream, initialGarment?: GarmentReference): Promise<void> {
+    // If no credentials configured yet, attempt local backend credentials lookup
+    if (!this.apiKey && !this.proxy) {
+      try {
+        const res = await fetch('http://localhost:8000/api/v1/vto/credentials');
+        if (res.ok) {
+          const creds = await res.json();
+          if (creds?.api_key) {
+            this.apiKey = creds.api_key;
+            console.log('[MIRAI] Decart credentials loaded from local backend environment.');
+          }
+        }
+      } catch {
+        // Backend not running or unreachable
+      }
+    }
+
     if (!this.apiKey && !this.proxy) {
       this.setState('error');
       const err = new Error(
-        'DECART_API_KEY_REQUIRED: Please configure a Decart API key or proxy URL to start Live Lucy V-TON.'
+        'DECART_API_KEY_REQUIRED: Please configure a Decart API key to start Live Lucy V-TON prototype.'
       );
       this.emit('error', err);
       throw err;
@@ -259,3 +278,5 @@ export class DecartLucyVTOProvider implements ILiveVTOProvider {
     }
   }
 }
+
+export { DecartLucyVTOProvider as DecartVTOProvider };

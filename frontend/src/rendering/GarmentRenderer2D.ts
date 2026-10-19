@@ -3,41 +3,37 @@
  *
  * Real-Time Photographic Unified Triangulated Mesh Warping Garment Renderer.
  *
- * Architecture & Key Innovations:
- * 1. UNIFIED CONTINUOUS DEFORMABLE MESH:
- *    - All 32 triangles across torso and both articulated sleeves form a SINGLE
- *      continuous fabric mesh across the master photographic asset:
- *      /garments/camp_collar_linen_shirt.png (1024x1024 RGBA).
- *    - Sleeves and torso STRICTLY SHARE the shoulder seam and armpit vertices.
- *      Zero armpit tearing, zero gaps, zero rectangular strip artifacts.
+ * UPDATE (dress not visible fix):
+ *   1. enableGarmentMesh now defaults to TRUE. It was false and nothing ever enabled it,
+ *      so the garment was never drawn (MirrorView/useLiveAR already decide when the
+ *      self-hosted engine is active via isARActive).
+ *   2. Per-product textures: loadProduct() now builds a texture for the selected product.
+ *        - If GarmentRegistry has a referenceImageUrl for the product, that image is used.
+ *          (Custom images MUST use the same 1024x1024 layout as the master shirt, because
+ *           the mesh UV map is fixed.)
+ *        - Otherwise the master linen shirt is RECOLORED with the product's main color.
+ *   3. Fixed affine-transform bug in drawTexturedTriangle (d2.x was used instead of d2.y
+ *      in the `d` and `f` terms), which skewed/warped the mesh.
+ *   4. Texture load failures now throw, so useLiveAR reports garment: 'error' in the console.
  *
- * 2. REAL-TIME ARTICULATION & 3D CYLINDRICAL DEFORMATION:
- *    - Sleeves follow live arm vectors (Shoulder 11/12 -> Elbow 13/14) with
- *      anatomical deltoid bicep curve.
- *    - Torso deforms with 3D body yaw / depth perspective derived from Z coordinates.
- *    - Continuous piecewise affine triangle mapping (Canvas 2D transform) with
- *      subpixel centroid expansion to eliminate anti-aliasing seam artifacts.
- *
- * 3. 3D CYLINDRICAL FABRIC SHADING:
- *    - Anatomical cylindrical ambient shading along lateral torso flanks.
- *    - Soft collar drop shadow gives real textile thickness and depth.
- *
- * 4. MULTI-LAYER ANATOMICAL OCCLUSION:
- *    - Collar Anchor strictly clamped below chin/mouth landmarks; beard, jaw,
- *      and face remain 100% uncovered.
- *    - Camp collar open V-neck throat cutout lets real chest/neck show naturally.
- *    - Forearm Occlusion restores real arms/hands when crossing in front of torso.
- *    - Optional MediaPipe Segmentation Mask compositing.
+ * Architecture:
+ *   - 32 triangles across torso + both sleeves form ONE continuous deformable mesh
+ *     over a 1024x1024 RGBA master asset (/garments/camp_collar_linen_shirt.png).
+ *   - Sleeves follow live arm vectors; torso deforms with body yaw (Z coordinates).
+ *   - Cylindrical shading, collar shadow, throat cutout and forearm occlusion.
  */
 
 import type { IGarmentRenderer } from './garmentRenderer';
 import type { TrackingFrame } from '../types/tracking';
 import type { Product } from '../types/api';
+import { getGarmentReference } from '../services/GarmentRegistry';
 
 // EMA smoothing factor: 0.35 gives responsive tracking without jitter
 const EMA_ALPHA = 0.35;
-const VISIBILITY_THRESHOLD = 0.30;
+const VISIBILITY_THRESHOLD = 0.3;
 const FADE_DURATION_MS = 600;
+
+const MASTER_URL = '/garments/camp_collar_linen_shirt.png';
 
 // Standard MediaPipe Pose bone connections
 const POSE_CONNECTIONS: [number, number][] = [
@@ -67,13 +63,79 @@ interface ScreenPoint extends Point {
   z?: number;
 }
 
+// ── Texture helpers ──────────────────────────────────────────────────────────
+
+function loadImage(url: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error(`Could not load image: ${url}`));
+    img.src = url;
+  });
+}
+
+function parseHex(hex: string | undefined | null): { r: number; g: number; b: number } | null {
+  if (!hex) return null;
+  let h = hex.trim().replace('#', '');
+  if (h.length === 3) h = h.split('').map((c) => c + c).join('');
+  if (!/^[0-9a-fA-F]{6}/.test(h)) return null;
+  return {
+    r: parseInt(h.slice(0, 2), 16),
+    g: parseInt(h.slice(2, 4), 16),
+    b: parseInt(h.slice(4, 6), 16),
+  };
+}
+
 /**
- * Maps a source triangle (s0, s1, s2) on img to destination triangle (d0, d1, d2) on canvas.
+ * Recolors the master shirt to `hex` while keeping its fabric detail & transparency.
+ */
+function tintTexture(master: HTMLImageElement, hex: string | undefined | null): HTMLCanvasElement | null {
+  const rgb = parseHex(hex);
+  if (!rgb) return null;
+
+  const w = master.naturalWidth || 1024;
+  const h = master.naturalHeight || 1024;
+
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  const t = c.getContext('2d');
+  if (!t) return null;
+
+  // 1. Base fabric
+  t.drawImage(master, 0, 0, w, h);
+
+  // 2. Apply hue/saturation of the product color, keep fabric luminance
+  t.globalCompositeOperation = 'color';
+  t.fillStyle = `rgb(${rgb.r}, ${rgb.g}, ${rgb.b})`;
+  t.fillRect(0, 0, w, h);
+
+  // 3. Restore the original shirt silhouette (alpha)
+  t.globalCompositeOperation = 'destination-in';
+  t.drawImage(master, 0, 0, w, h);
+
+  // 4. Lightness correction so dark / white garments look right
+  const lum = (0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b) / 255;
+  t.globalCompositeOperation = 'source-atop';
+  if (lum < 0.5) {
+    t.fillStyle = `rgba(0, 0, 0, ${Math.min(0.85, (0.5 - lum) * 1.7)})`;
+    t.fillRect(0, 0, w, h);
+  } else if (lum > 0.8) {
+    t.fillStyle = `rgba(255, 255, 255, ${Math.min(0.7, (lum - 0.8) * 3)})`;
+    t.fillRect(0, 0, w, h);
+  }
+
+  t.globalCompositeOperation = 'source-over';
+  return c;
+}
+
+/**
+ * Maps a source triangle (s0, s1, s2) on the texture to destination triangle (d0, d1, d2) on canvas.
  * Applies affine transformation matrix with 0.6px seam expansion to prevent anti-aliasing gaps.
  */
 function drawTexturedTriangle(
   ctx: CanvasRenderingContext2D,
-  img: HTMLImageElement,
+  img: CanvasImageSource,
   s0: Point, s1: Point, s2: Point,
   d0: Point, d1: Point, d2: Point
 ): void {
@@ -83,9 +145,11 @@ function drawTexturedTriangle(
   const a = (d0.x * (s1.y - s2.y) + d1.x * (s2.y - s0.y) + d2.x * (s0.y - s1.y)) / delta;
   const b = (d0.y * (s1.y - s2.y) + d1.y * (s2.y - s0.y) + d2.y * (s0.y - s1.y)) / delta;
   const c = (d0.x * (s2.x - s1.x) + d1.x * (s0.x - s2.x) + d2.x * (s1.x - s0.x)) / delta;
-  const d = (d0.y * (s2.x - s1.x) + d1.y * (s0.x - s2.x) + d2.x * (s1.x - s0.x)) / delta;
+  // FIX: last term uses d2.y (was d2.x)
+  const d = (d0.y * (s2.x - s1.x) + d1.y * (s0.x - s2.x) + d2.y * (s1.x - s0.x)) / delta;
   const e = (d0.x * (s1.x * s2.y - s2.x * s1.y) + d1.x * (s2.x * s0.y - s0.x * s2.y) + d2.x * (s0.x * s1.y - s1.x * s0.y)) / delta;
-  const f = (d0.y * (s1.x * s2.y - s2.x * s1.y) + d1.y * (s2.x * s0.y - s0.x * s2.y) + d2.x * (s0.x * s1.y - s1.x * s0.y)) / delta;
+  // FIX: last term uses d2.y (was d2.x)
+  const f = (d0.y * (s1.x * s2.y - s2.x * s1.y) + d1.y * (s2.x * s0.y - s0.x * s2.y) + d2.y * (s0.x * s1.y - s1.x * s0.y)) / delta;
 
   // Compute centroid for slight seam-bleed padding (0.6px)
   const cx = (d0.x + d1.x + d2.x) / 3;
@@ -117,71 +181,70 @@ function drawTexturedTriangle(
  */
 const MESH_UV_VERTICES: Record<string, Point> = {
   // Collar & Neck
-  neckL:            { x: 380, y: 100 }, // Screen Left collar notch
-  neckR:            { x: 644, y: 100 }, // Screen Right collar notch
-  collarTip:        { x: 512, y: 310 }, // V-neck apex where camp collar flaps join
+  neckL:            { x: 380, y: 100 },
+  neckR:            { x: 644, y: 100 },
+  collarTip:        { x: 512, y: 310 },
   neckBack:         { x: 512, y: 80 },
 
   // Shoulders & Yoke
-  shoulderL:        { x: 185, y: 230 }, // Left outer shoulder seam
-  shoulderR:        { x: 839, y: 230 }, // Right outer shoulder seam
-  yokeL:            { x: 280, y: 130 }, // Left trapezius slope
-  yokeR:            { x: 744, y: 130 }, // Right trapezius slope
+  shoulderL:        { x: 185, y: 230 },
+  shoulderR:        { x: 839, y: 230 },
+  yokeL:            { x: 280, y: 130 },
+  yokeR:            { x: 744, y: 130 },
 
-  // Left Sleeve (Short Sleeve, Screen Left - X < 512)
-  sleeveMidL:       { x: 100, y: 320 }, // Deltoid outer curve
-  sleeveCuffOuterL: { x: 58,  y: 400 }, // Outer sleeve cuff corner
-  sleeveCuffInnerL: { x: 190, y: 520 }, // Inner sleeve underarm cuff corner
+  // Left Sleeve
+  sleeveMidL:       { x: 100, y: 320 },
+  sleeveCuffOuterL: { x: 58,  y: 400 },
+  sleeveCuffInnerL: { x: 190, y: 520 },
 
-  // Right Sleeve (Short Sleeve, Screen Right - X > 512)
-  sleeveMidR:       { x: 924, y: 320 }, // Deltoid outer curve
-  sleeveCuffOuterR: { x: 966, y: 400 }, // Outer sleeve cuff corner
-  sleeveCuffInnerR: { x: 834, y: 520 }, // Inner sleeve underarm cuff corner
+  // Right Sleeve
+  sleeveMidR:       { x: 924, y: 320 },
+  sleeveCuffOuterR: { x: 966, y: 400 },
+  sleeveCuffInnerR: { x: 834, y: 520 },
 
-  // Torso & Chest (Shared seam vertices with sleeves!)
-  armpitL:          { x: 244, y: 490 }, // Left underarm seam (SHARED WITH LEFT SLEEVE!)
-  armpitR:          { x: 780, y: 490 }, // Right underarm seam (SHARED WITH RIGHT SLEEVE!)
-  chestMid:         { x: 512, y: 490 }, // Mid-chest placket
-  chestL:           { x: 378, y: 490 }, // Left pectoral
-  chestR:           { x: 646, y: 490 }, // Right pectoral
+  // Torso & Chest (shared seam vertices with sleeves)
+  armpitL:          { x: 244, y: 490 },
+  armpitR:          { x: 780, y: 490 },
+  chestMid:         { x: 512, y: 490 },
+  chestL:           { x: 378, y: 490 },
+  chestR:           { x: 646, y: 490 },
 
   // Waist & Midriff
-  waistL:           { x: 244, y: 720 }, // Left waist side seam
+  waistL:           { x: 244, y: 720 },
   waistML:          { x: 378, y: 720 },
-  waistMid:         { x: 512, y: 720 }, // Center waist button placket
+  waistMid:         { x: 512, y: 720 },
   waistMR:          { x: 646, y: 720 },
-  waistR:           { x: 780, y: 720 }, // Right waist side seam
+  waistR:           { x: 780, y: 720 },
 
   // Bottom Hem
-  hemL:             { x: 240, y: 960 }, // Left hem corner
+  hemL:             { x: 240, y: 960 },
   hemML:            { x: 376, y: 960 },
-  hemMid:           { x: 512, y: 960 }, // Center bottom hem
+  hemMid:           { x: 512, y: 960 },
   hemMR:            { x: 648, y: 960 },
-  hemR:             { x: 784, y: 960 }, // Right hem corner
+  hemR:             { x: 784, y: 960 },
 };
 
 /**
  * 32 Interconnected Triangles forming the Unified Fabric Mesh.
- * All adjacent triangles share common edges, preventing any tearing or gaps.
  */
 const MESH_TRIANGLES: [string, string, string][] = [
-  // ── Left Sleeve (Continuous with shoulderL and armpitL) ──
+  // Left Sleeve
   ['shoulderL', 'sleeveMidL', 'armpitL'],
   ['sleeveMidL', 'sleeveCuffOuterL', 'sleeveCuffInnerL'],
   ['sleeveMidL', 'sleeveCuffInnerL', 'armpitL'],
 
-  // ── Right Sleeve (Continuous with shoulderR and armpitR) ──
+  // Right Sleeve
   ['shoulderR', 'armpitR', 'sleeveMidR'],
   ['sleeveMidR', 'sleeveCuffInnerR', 'sleeveCuffOuterR'],
   ['sleeveMidR', 'armpitR', 'sleeveCuffInnerR'],
 
-  // ── Shoulders & Yoke ──
+  // Shoulders & Yoke
   ['neckL', 'yokeL', 'shoulderL'],
   ['neckL', 'shoulderL', 'armpitL'],
   ['neckR', 'shoulderR', 'yokeR'],
   ['neckR', 'armpitR', 'shoulderR'],
 
-  // ── Collar & Upper Chest ──
+  // Collar & Upper Chest
   ['neckL', 'collarTip', 'chestL'],
   ['neckL', 'chestL', 'armpitL'],
   ['neckR', 'chestR', 'collarTip'],
@@ -189,7 +252,7 @@ const MESH_TRIANGLES: [string, string, string][] = [
   ['collarTip', 'chestMid', 'chestL'],
   ['collarTip', 'chestR', 'chestMid'],
 
-  // ── Mid Chest to Waist ──
+  // Mid Chest to Waist
   ['armpitL', 'chestL', 'waistML'],
   ['armpitL', 'waistML', 'waistL'],
   ['chestL', 'chestMid', 'waistMid'],
@@ -199,7 +262,7 @@ const MESH_TRIANGLES: [string, string, string][] = [
   ['chestR', 'armpitR', 'waistR'],
   ['chestR', 'waistR', 'waistMR'],
 
-  // ── Waist to Bottom Hem ──
+  // Waist to Bottom Hem
   ['waistL', 'waistML', 'hemML'],
   ['waistL', 'hemML', 'hemL'],
   ['waistML', 'waistMid', 'hemMid'],
@@ -215,15 +278,18 @@ export class GarmentRenderer2D implements IGarmentRenderer {
   private ctx!: CanvasRenderingContext2D;
   private currentProduct: Product | null = null;
   private showSkeleton: boolean = true;
-  private enableGarmentMesh: boolean = false;
+
+  // FIX: enabled by default. MirrorView/useLiveAR decide when the KVGE engine is active.
+  private enableGarmentMesh: boolean = true;
 
   setEnableGarmentMesh(enable: boolean): void {
     this.enableGarmentMesh = enable;
   }
 
-  // Master photographic linen texture (1024x1024)
-  private masterShirtImg: HTMLImageElement | null = null;
-  private imagesLoaded: boolean = false;
+  // Master photographic linen texture (1024x1024) + the texture for the selected product
+  private masterPromise: Promise<HTMLImageElement | null>;
+  private garmentTexture: CanvasImageSource | null = null;
+  private loadToken = 0;
 
   // Offscreen buffer for compositing and segmentation masking
   private offscreenCanvas: HTMLCanvasElement | null = null;
@@ -235,19 +301,13 @@ export class GarmentRenderer2D implements IGarmentRenderer {
   private opacity = 0;
 
   constructor() {
-    this.preloadGarmentTextures();
-  }
-
-  private preloadGarmentTextures(): void {
-    const master = new Image();
-    master.src = '/garments/camp_collar_linen_shirt.png';
-    master.onload = () => {
-      this.masterShirtImg = master;
-      this.imagesLoaded = true;
-    };
-    master.onerror = (e) => {
-      console.warn('[MIRAI] Could not load master linen shirt texture:', e);
-    };
+    this.masterPromise = loadImage(MASTER_URL).catch((e) => {
+      console.error(
+        `[MIRAI] Could not load master garment texture. Make sure the file exists at frontend/public${MASTER_URL}`,
+        e
+      );
+      return null;
+    });
   }
 
   initialize(canvas: HTMLCanvasElement): void {
@@ -267,14 +327,53 @@ export class GarmentRenderer2D implements IGarmentRenderer {
     this.showSkeleton = show;
   }
 
-  loadProduct(product: Product): Promise<void> {
+  /**
+   * Builds the texture for the selected product.
+   *  1. Registry image (if provided) — must share the master's 1024x1024 layout.
+   *  2. Otherwise: master shirt recolored with the product's main color.
+   */
+  async loadProduct(product: Product): Promise<void> {
+    const token = ++this.loadToken;
     this.currentProduct = product;
     this.opacity = 0;
-    return Promise.resolve();
+
+    const master = await this.masterPromise;
+    if (token !== this.loadToken) return; // a newer product was selected
+
+    const refUrl = getGarmentReference(product.id)?.referenceImageUrl || '';
+    let texture: CanvasImageSource | null = null;
+
+    if (refUrl && refUrl !== MASTER_URL) {
+      try {
+        texture = await loadImage(refUrl);
+      } catch (err) {
+        console.warn('[MIRAI] Product garment image failed, using recolored master shirt:', refUrl, err);
+      }
+    } else if (refUrl === MASTER_URL && master) {
+      texture = master; // the real linen shirt, natural color
+    }
+
+    if (!texture && master) {
+      const hex = (product as { colors?: { hex?: string }[] }).colors?.[0]?.hex;
+      texture = tintTexture(master, hex) ?? master;
+    }
+
+    if (token !== this.loadToken) return;
+
+    if (!texture) {
+      this.garmentTexture = null;
+      throw new Error(
+        `No garment texture available for ${product.id}. Check that frontend/public${MASTER_URL} exists.`
+      );
+    }
+
+    this.garmentTexture = texture;
   }
 
   unloadGarment(): void {
+    this.loadToken++;
     this.currentProduct = null;
+    this.garmentTexture = null;
     this.clear();
   }
 
@@ -293,6 +392,7 @@ export class GarmentRenderer2D implements IGarmentRenderer {
   dispose(): void {
     this.clear();
     this.currentProduct = null;
+    this.garmentTexture = null;
   }
 
   renderFrame(
@@ -304,14 +404,17 @@ export class GarmentRenderer2D implements IGarmentRenderer {
     this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
 
     // Sync offscreen buffer dimensions
-    if (this.offscreenCanvas && (this.offscreenCanvas.width !== this.canvas.width || this.offscreenCanvas.height !== this.canvas.height)) {
+    if (
+      this.offscreenCanvas &&
+      (this.offscreenCanvas.width !== this.canvas.width ||
+        this.offscreenCanvas.height !== this.canvas.height)
+    ) {
       this.offscreenCanvas.width = this.canvas.width;
       this.offscreenCanvas.height = this.canvas.height;
     }
 
     const isTracked =
-      tracking.tracking_state === 'tracked' &&
-      tracking.landmarks.length > 0;
+      tracking.tracking_state === 'tracked' && tracking.landmarks.length > 0;
 
     // ── Update Opacity ──────────────────────────────────────────────────
     if (isTracked) {
@@ -334,32 +437,27 @@ export class GarmentRenderer2D implements IGarmentRenderer {
     const { scale: coverScale, offsetX, offsetY } = this.getCoverTransform(tracking);
     const toScreen = (id: number): ScreenPoint | null => {
       const lm = this.smoothed.get(id);
-      const rawLm = tracking.landmarks.find(l => l.id === id);
+      const rawLm = tracking.landmarks.find((l) => l.id === id);
       if (!lm) return null;
       const vis = rawLm?.visibility ?? 0;
       // Mirror flip: screen_x = offsetX + (1 - normalized_x) * videoW * coverScale
       return {
-        x: offsetX + (1 - lm.x) * tracking.frame_width  * coverScale,
-        y: offsetY +       lm.y  * tracking.frame_height * coverScale,
+        x: offsetX + (1 - lm.x) * tracking.frame_width * coverScale,
+        y: offsetY + lm.y * tracking.frame_height * coverScale,
         z: lm.z,
         visibility: vis,
       };
     };
 
+    // ── Render Garment Mesh (under the skeleton) ─────────────────────────
+    const garment = selectedGarment ?? this.currentProduct;
+    if (this.enableGarmentMesh && garment && this.opacity >= 0.01 && this.garmentTexture) {
+      this.renderUnifiedContinuousGarment(toScreen, tracking, videoElement, maskCanvas);
+    }
+
     // ── Draw Skeleton (if enabled) ───────────────────────────────────────
     if (this.showSkeleton && isTracked) {
       this.drawSkeleton(toScreen);
-    }
-
-    // ── Render Garment Mesh (DISABLED: MIRAI now uses Decart Lucy V-TON neural stream) ──
-    const garment = selectedGarment ?? this.currentProduct;
-    if (this.enableGarmentMesh && garment && this.opacity >= 0.01 && this.imagesLoaded && this.masterShirtImg) {
-      this.renderUnifiedContinuousGarment(
-        toScreen,
-        tracking,
-        videoElement,
-        maskCanvas
-      );
     }
   }
 
@@ -371,7 +469,8 @@ export class GarmentRenderer2D implements IGarmentRenderer {
     videoElement?: HTMLVideoElement,
     _maskCanvas?: HTMLCanvasElement | OffscreenCanvas
   ): void {
-    if (!this.masterShirtImg || !this.offscreenCtx || !this.offscreenCanvas) return;
+    const texture = this.garmentTexture;
+    if (!texture || !this.offscreenCtx || !this.offscreenCanvas) return;
 
     // 1. Core Pose Landmarks
     // Landmark 11 (wearer's left shoulder) -> Screen Left (viewer's left)
@@ -408,8 +507,8 @@ export class GarmentRenderer2D implements IGarmentRenderer {
     const zR = sR.z ?? 0;
     const yaw = Math.max(-0.6, Math.min(0.6, (zR - zL) * 2.2));
     const centerShift: Point = {
-      x: uAcross.x * (yaw * shoulderSpan * 0.10),
-      y: uAcross.y * (yaw * shoulderSpan * 0.10),
+      x: uAcross.x * (yaw * shoulderSpan * 0.1),
+      y: uAcross.y * (yaw * shoulderSpan * 0.1),
     };
 
     // 4. Anatomical Chin Line & Collar Clamping
@@ -428,7 +527,7 @@ export class GarmentRenderer2D implements IGarmentRenderer {
     };
 
     // Neck base notches (sides of throat)
-    const neckSpan = shoulderSpan * 0.20;
+    const neckSpan = shoulderSpan * 0.2;
     const neckBaseY = Math.max(chinY + 8, sMid.y - shoulderSpan * 0.05);
     const d_neckL: Point = {
       x: sMid.x - uAcross.x * neckSpan,
@@ -444,7 +543,7 @@ export class GarmentRenderer2D implements IGarmentRenderer {
     };
 
     // 5. Tailored Shoulders & Yoke Ridge
-    const padOut = shoulderSpan * 0.10;
+    const padOut = shoulderSpan * 0.1;
     const padUp = shoulderSpan * 0.03;
     const d_shoulderL: Point = {
       x: sL.x - uAcross.x * padOut - uDown.x * padUp,
@@ -464,7 +563,7 @@ export class GarmentRenderer2D implements IGarmentRenderer {
     };
 
     // 6. Armpits & Chest Mid
-    const armpitDepth = shoulderSpan * 0.40;
+    const armpitDepth = shoulderSpan * 0.4;
     const d_armpitL: Point = {
       x: sL.x - uAcross.x * (shoulderSpan * 0.02) + uDown.x * armpitDepth,
       y: sL.y - uAcross.y * (shoulderSpan * 0.02) + uDown.y * armpitDepth,
@@ -486,14 +585,14 @@ export class GarmentRenderer2D implements IGarmentRenderer {
       y: (d_armpitR.y + d_chestMid.y) * 0.5,
     };
 
-    // 7. Articulated Left Sleeve (Connected to ShoulderL and ArmpitL!)
+    // 7. Articulated Left Sleeve
     let targetElbowL: Point;
     if (eL && eL.visibility > VISIBILITY_THRESHOLD) {
       targetElbowL = { x: eL.x, y: eL.y };
     } else {
       targetElbowL = {
-        x: d_shoulderL.x - uAcross.x * (shoulderSpan * 0.20) + uDown.x * (shoulderSpan * 0.78),
-        y: d_shoulderL.y - uAcross.y * (shoulderSpan * 0.20) + uDown.y * (shoulderSpan * 0.78),
+        x: d_shoulderL.x - uAcross.x * (shoulderSpan * 0.2) + uDown.x * (shoulderSpan * 0.78),
+        y: d_shoulderL.y - uAcross.y * (shoulderSpan * 0.2) + uDown.y * (shoulderSpan * 0.78),
       };
     }
     const vArmL: Point = { x: targetElbowL.x - d_shoulderL.x, y: targetElbowL.y - d_shoulderL.y };
@@ -516,18 +615,18 @@ export class GarmentRenderer2D implements IGarmentRenderer {
       y: pCuffMidL.y + uPerpL.y * cuffHalfWidth,
     };
     const d_sleeveMidL: Point = {
-      x: d_shoulderL.x + vArmL.x * 0.30 - uPerpL.x * (shoulderSpan * 0.18),
-      y: d_shoulderL.y + vArmL.y * 0.30 - uPerpL.y * (shoulderSpan * 0.18),
+      x: d_shoulderL.x + vArmL.x * 0.3 - uPerpL.x * (shoulderSpan * 0.18),
+      y: d_shoulderL.y + vArmL.y * 0.3 - uPerpL.y * (shoulderSpan * 0.18),
     };
 
-    // 8. Articulated Right Sleeve (Connected to ShoulderR and ArmpitR!)
+    // 8. Articulated Right Sleeve
     let targetElbowR: Point;
     if (eR && eR.visibility > VISIBILITY_THRESHOLD) {
       targetElbowR = { x: eR.x, y: eR.y };
     } else {
       targetElbowR = {
-        x: d_shoulderR.x + uAcross.x * (shoulderSpan * 0.20) + uDown.x * (shoulderSpan * 0.78),
-        y: d_shoulderR.y + uAcross.y * (shoulderSpan * 0.20) + uDown.y * (shoulderSpan * 0.78),
+        x: d_shoulderR.x + uAcross.x * (shoulderSpan * 0.2) + uDown.x * (shoulderSpan * 0.78),
+        y: d_shoulderR.y + uAcross.y * (shoulderSpan * 0.2) + uDown.y * (shoulderSpan * 0.78),
       };
     }
     const vArmR: Point = { x: targetElbowR.x - d_shoulderR.x, y: targetElbowR.y - d_shoulderR.y };
@@ -548,8 +647,8 @@ export class GarmentRenderer2D implements IGarmentRenderer {
       y: pCuffMidR.y - uPerpR.y * cuffHalfWidth,
     };
     const d_sleeveMidR: Point = {
-      x: d_shoulderR.x + vArmR.x * 0.30 + uPerpR.x * (shoulderSpan * 0.18),
-      y: d_shoulderR.y + vArmR.y * 0.30 + uPerpR.y * (shoulderSpan * 0.18),
+      x: d_shoulderR.x + vArmR.x * 0.3 + uPerpR.x * (shoulderSpan * 0.18),
+      y: d_shoulderR.y + vArmR.y * 0.3 + uPerpR.y * (shoulderSpan * 0.18),
     };
 
     // 9. Waist & Hem (With Seated User Fallback)
@@ -557,7 +656,7 @@ export class GarmentRenderer2D implements IGarmentRenderer {
     let torsoLen = shoulderSpan * 1.38;
     if (hipsTracked && hL && hR) {
       const hipMidY = (hL.y + hR.y) * 0.5;
-      torsoLen = Math.max(shoulderSpan * 1.25, (hipMidY - sMid.y) + shoulderSpan * 0.12);
+      torsoLen = Math.max(shoulderSpan * 1.25, hipMidY - sMid.y + shoulderSpan * 0.12);
     }
 
     const hemCenter: Point = {
@@ -650,7 +749,7 @@ export class GarmentRenderer2D implements IGarmentRenderer {
     const oCtx = this.offscreenCtx;
     oCtx.clearRect(0, 0, this.offscreenCanvas.width, this.offscreenCanvas.height);
 
-    // Draw all 32 connected triangles across the single master texture
+    // Draw all connected triangles across the single garment texture
     for (const [v0, v1, v2] of MESH_TRIANGLES) {
       const s0 = MESH_UV_VERTICES[v0];
       const s1 = MESH_UV_VERTICES[v1];
@@ -660,7 +759,7 @@ export class GarmentRenderer2D implements IGarmentRenderer {
       const d2 = destMap[v2];
       if (!s0 || !s1 || !s2 || !d0 || !d1 || !d2) continue;
 
-      drawTexturedTriangle(oCtx, this.masterShirtImg, s0, s1, s2, d0, d1, d2);
+      drawTexturedTriangle(oCtx, texture, s0, s1, s2, d0, d1, d2);
     }
 
     // ── 11. CYLINDRICAL FABRIC SHADING PASS ──────────────────────────────
@@ -688,7 +787,10 @@ export class GarmentRenderer2D implements IGarmentRenderer {
   ): void {
     ctx.save();
 
-    // 1. Left Flank Shadow (Curves into background on left side)
+    // Keep shading inside the garment silhouette only
+    ctx.globalCompositeOperation = 'source-atop';
+
+    // 1. Left Flank Shadow
     const gradL = ctx.createLinearGradient(pts.armpitL.x, pts.armpitL.y, pts.chestL.x, pts.chestL.y);
     gradL.addColorStop(0, 'rgba(0, 0, 0, 0.28)');
     gradL.addColorStop(0.5, 'rgba(0, 0, 0, 0.08)');
@@ -706,7 +808,7 @@ export class GarmentRenderer2D implements IGarmentRenderer {
     ctx.closePath();
     ctx.fill();
 
-    // 2. Right Flank Shadow (Curves into background on right side)
+    // 2. Right Flank Shadow
     const gradR = ctx.createLinearGradient(pts.armpitR.x, pts.armpitR.y, pts.chestR.x, pts.chestR.y);
     gradR.addColorStop(0, 'rgba(0, 0, 0, 0.28)');
     gradR.addColorStop(0.5, 'rgba(0, 0, 0, 0.08)');
@@ -749,8 +851,7 @@ export class GarmentRenderer2D implements IGarmentRenderer {
   // ── Layer Occlusions ─────────────────────────────────────────────────
 
   /**
-   * Restores the customer's real throat, chin, and chest in the open Camp Collar V-opening.
-   * Guarantees beard, jawline, and neck are 100% visible and unmasked.
+   * Restores the customer's real throat, chin, and chest in the open collar V-opening.
    */
   private renderThroatCutoutOcclusion(
     ctx: CanvasRenderingContext2D,
@@ -778,8 +879,8 @@ export class GarmentRenderer2D implements IGarmentRenderer {
 
   /**
    * Dynamic Forearm & Hand Occlusion.
-   * If the customer raises their hands or crosses their arms across their chest,
-   * the real camera feed of the forearm and hand is drawn in front of the virtual shirt.
+   * If the customer crosses their arms in front of the torso, the real camera feed
+   * of the forearm and hand is drawn in front of the virtual garment.
    */
   private renderForearmOcclusion(
     ctx: CanvasRenderingContext2D,
@@ -906,15 +1007,17 @@ export class GarmentRenderer2D implements IGarmentRenderer {
   }
 
   private getCoverTransform(tracking: TrackingFrame): {
-    scale: number; offsetX: number; offsetY: number;
+    scale: number;
+    offsetX: number;
+    offsetY: number;
   } {
-    const vW = tracking.frame_width  || 1280;
+    const vW = tracking.frame_width || 1280;
     const vH = tracking.frame_height || 720;
-    const cW = this.canvas.width  || 1;
+    const cW = this.canvas.width || 1;
     const cH = this.canvas.height || 1;
 
-    const videoAspect   = vW / vH;
-    const canvasAspect  = cW / cH;
+    const videoAspect = vW / vH;
+    const canvasAspect = cW / cH;
 
     let scale: number;
     if (videoAspect > canvasAspect) {

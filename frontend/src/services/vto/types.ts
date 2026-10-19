@@ -1,9 +1,15 @@
 /**
  * MIRAI — Live Virtual Try-On (VTO) Provider Architecture
  *
- * Pluggable streaming interface decoupling the Live VTO engine from the MIRAI Smart Mirror UI.
- * Designed specifically for Real-Time Streaming Neural Video models (e.g. Decart Lucy V-TON).
+ * Pluggable streaming and rendering interface decoupling the Live VTO engine
+ * from the MIRAI Smart Mirror UI.
+ *
+ * Supports:
+ *   1. DecartVTOProvider   — Temporary Cloud Neural Prototype (Decart Lucy V-TON via WebRTC)
+ *   2. MiraiVTOProvider    — Self-Hosted Engine (Kinematic Volumetric Garment Engine / KVGE)
  */
+
+export type VTOProviderType = 'decart' | 'mirai_kvge';
 
 export type VTOConnectionState =
   | 'idle'
@@ -48,13 +54,18 @@ export type VTOEventMap = {
   quality: VTOQualityReport;
 };
 
-export interface ILiveVTOProvider {
-  readonly id: string;
+export interface IVTOProvider {
+  readonly id: VTOProviderType | string;
   readonly name: string;
   readonly modelName: string;
+  readonly isTemporaryPrototype: boolean;
+  readonly renderMode: 'stream' | 'canvas';
+  readonly description: string;
 
   /**
-   * Connects the local webcam stream to the real-time VTO session via WebRTC.
+   * Connects the local webcam stream to the VTO session.
+   * For streaming neural providers (Decart), establishes WebRTC connection.
+   * For self-hosted providers (KVGE), initializes edge tracking and mesh pipeline.
    * @param cameraStream The customer's local webcam MediaStream
    * @param initialGarment The starting garment reference to apply
    */
@@ -62,13 +73,13 @@ export interface ILiveVTOProvider {
 
   /**
    * Dynamically updates the active garment during an ongoing live session.
-   * Does NOT tear down the WebRTC connection.
+   * Does NOT tear down the connection.
    */
   setGarment(garment: GarmentReference): Promise<void>;
 
   /**
    * Returns the transformed remote video stream received from the neural model.
-   * When connected, this stream is played in the mirror viewport.
+   * Null if renderMode is 'canvas' (e.g. self-hosted KVGE).
    */
   getRemoteStream(): MediaStream | null;
 
@@ -78,10 +89,15 @@ export interface ILiveVTOProvider {
   getConnectionState(): VTOConnectionState;
 
   /**
-   * Closes the session and releases WebRTC resources.
+   * Closes the session and releases resources.
    */
   disconnect(): void;
 
   on<K extends keyof VTOEventMap>(event: K, listener: (data: VTOEventMap[K]) => void): void;
   off<K extends keyof VTOEventMap>(event: K, listener: (data: VTOEventMap[K]) => void): void;
 }
+
+/**
+ * Backward compatibility alias for existing consumers.
+ */
+export type ILiveVTOProvider = IVTOProvider;

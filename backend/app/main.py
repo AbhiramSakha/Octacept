@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .api.products import router as products_router
 from .api.sessions import router as sessions_router
 from .api.tryon import router as tryon_router
+from .api.vto import router as vto_router
 
 app = FastAPI(
     title="MIRAI Backend API",
@@ -30,6 +31,7 @@ app.add_middleware(
 app.include_router(products_router, prefix="/api")
 app.include_router(sessions_router, prefix="/api")
 app.include_router(tryon_router, prefix="/api")
+app.include_router(vto_router, prefix="/api")
 
 
 @app.get("/health", tags=["Health"])

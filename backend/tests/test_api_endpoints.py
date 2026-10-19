@@ -82,6 +82,31 @@ class TestFastAPIEndpoints(unittest.TestCase):
         self.assertTrue(session["session_id"].startswith("sess_"))
         self.assertEqual(session["status"], "active")
 
+    def test_vto_config_endpoint(self):
+        if not self.has_testclient:
+            self.skipTest("fastapi[testclient] not installed in environment")
+        response = self.client.get("/api/v1/vto/config")
+        self.assertEqual(response.status_code, 200)
+        config = response.json()
+        self.assertIn("configured_provider", config)
+        self.assertIn("providers", config)
+        provider_ids = [p["id"] for p in config["providers"]]
+        self.assertIn("decart", provider_ids)
+        self.assertIn("mirai_kvge", provider_ids)
+        # Check Decart is flagged as temporary prototype
+        decart_info = next(p for p in config["providers"] if p["id"] == "decart")
+        self.assertTrue(decart_info["is_temporary_prototype"])
+
+    def test_vto_credentials_endpoint(self):
+        if not self.has_testclient:
+            self.skipTest("fastapi[testclient] not installed in environment")
+        response = self.client.get("/api/v1/vto/credentials")
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("provider", data)
+        self.assertEqual(data["provider"], "decart")
+        self.assertIn("has_key", data)
+
 
 if __name__ == "__main__":
     unittest.main()

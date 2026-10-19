@@ -44,6 +44,21 @@ export function useDecartVTO(): UseDecartVTOResult {
 
   const providerRef = useRef<DecartLucyVTOProvider | null>(null);
 
+  // Fetch credentials from backend environment if not present in client
+  useEffect(() => {
+    if (!apiKey) {
+      fetch('http://localhost:8000/api/v1/vto/credentials')
+        .then((res) => (res.ok ? res.json() : null))
+        .then((data) => {
+          if (data?.api_key) {
+            setApiKeyState(data.api_key);
+            console.log('[MIRAI] Decart API key loaded from backend environment.');
+          }
+        })
+        .catch(() => {});
+    }
+  }, [apiKey]);
+
   // Initialize provider on mount or apiKey change
   useEffect(() => {
     const provider = new DecartLucyVTOProvider({

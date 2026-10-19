@@ -30,6 +30,7 @@ class Product(BaseModel):
     colors: List[ProductColor]
     sizes: List[str]
     asset_2d_overlay: str
+    asset_3d_model: Optional[str] = None
     asset_thumbnail: str
     in_stock: bool = True
 

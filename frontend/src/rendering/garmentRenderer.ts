@@ -24,3 +24,12 @@ export interface IGarmentRenderer {
   clear(): void;
   dispose(): void;
 }
+
+/** Renderer surface used by useLiveAR — implemented by both GarmentRenderer2D and GarmentRenderer3D. */
+export interface IARGarmentRenderer extends IGarmentRenderer {
+  setShowSkeleton(show: boolean): void;
+  loadProduct(product: Product): Promise<void>;
+  unloadGarment(): void;
+}
+
+export type RenderMode = '2d' | '3d';
