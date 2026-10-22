@@ -12,13 +12,24 @@
  *   • Throttle React state updates (fps, trackingState) to ~8/s
  *   • Handle tracking loss / fade
  *
+ * UPDATE (measurements v2):
+ *   - Every frame now also sends MediaPipe WORLD landmarks (3D, metres) to onFrame,
+ *     used for true skeleton lengths (torso, arm, leg).
+ *   - While the segmentation mask is on, it also sends silhouette widths at chest / waist /
+ *     hip level and the detected hem row of the worn garment.
+ *   - FrameExtra type now lives in useBodyMeasurements.ts.
+ *
+ * UPDATE (size scan):
+ *   - New optional `onFrame` parameter. Every TrackingFrame is passed to it so
+ *     useBodyMeasurements.feedFrame can measure the body from real landmarks.
+ *
  * UPDATE (3D renderer):
  *   - New `renderMode` parameter ('3d' default | '2d'). The renderer is re-created when it changes
  *     and the selected product is reloaded into the new renderer.
  *
  * UPDATE (KVGE v2):
  *   1. MediaPipe WASM + model are served from /public/mediapipe (no CDN, works offline).
- *   2. outputSegmentationMasks is OFF (the mask was never used and cost a lot of FPS).
+ *   2. outputSegmentationMasks is OFF by default (costs FPS); switched on only when needed.
  *   3. Pose detection is skipped when the video has no new frame (video.currentTime check).
  *   4. Previous fixes kept: shoulder-based tracking confidence, GPU→CPU fallback,
  *      garment load status + retry, throttled error logging, 2s diagnostics.
@@ -30,6 +41,7 @@ import type { Product } from '../types/api';
 import type { TrackingFrame } from '../types/tracking';
 import { GarmentRenderer2D } from '../rendering/GarmentRenderer2D';
 import { GarmentRenderer3D } from '../rendering/GarmentRenderer3D';
+import type { FrameExtra } from './useBodyMeasurements';
 
 import type { IARGarmentRenderer, RenderMode } from '../rendering/garmentRenderer';
 
@@ -63,7 +75,6 @@ const SHOULDER_IDS = [11, 12];
 // ── Types ────────────────────────────────────────────────────────────────────
 
 export type ARTrackingState =
-
   | 'initializing'
   | 'ready'
   | 'searching'
@@ -96,7 +107,6 @@ const LANDMARK_NAMES: Record<number, string> = {
   6: 'right_eye_outer',
   7: 'left_ear',
   8: 'right_ear',
-
   9: 'mouth_left',
   10: 'mouth_right',
   11: 'left_shoulder',
@@ -123,16 +133,144 @@ const LANDMARK_NAMES: Record<number, string> = {
   32: 'right_foot_index',
 };
 
+// ── Silhouette + garment helpers ─────────────────────────────────────────────
+
+type LM = { x: number; y: number; visibility?: number };
+
+/** Median silhouette width (fraction of mask width) over 5 rows around yCenter. */
+function widthAround(
+  data: Float32Array,
+  mw: number,
+  mh: number,
+  cx: number,
+  yCenter: number,
+  step: number
+): number | null {
+  const x0 = Math.round(cx);
+  if (x0 < 0 || x0 >= mw) return null;
+  const widths: number[] = [];
+  for (let k = -2; k <= 2; k++) {
+    const y = Math.round(yCenter + k * step);
+    if (y < 0 || y >= mh) continue;
+    const row = y * mw;
+    if (data[row + x0] < 0.5) continue;
+    let l = x0;
+    let r = x0;
+    while (l > 0 && data[row + l - 1] >= 0.5) l--;
+    while (r < mw - 1 && data[row + r + 1] >= 0.5) r++;
+    widths.push(r - l + 1);
+  }
+  if (widths.length < 3) return null;
+  widths.sort((a, b) => a - b);
+  return widths[widths.length >> 1] / mw;
+}
+
+/** Silhouette widths (clothes included) at chest, waist and hip level. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function measureBodyWidths(mask: any, lm: LM[]): NonNullable<FrameExtra['widths']> {
+  const mw: number = mask.width;
+  const mh: number = mask.height;
+  const data: Float32Array = mask.getAsFloat32Array();
+  const out: NonNullable<FrameExtra['widths']> = {};
+  const span = Math.abs(lm[11].x - lm[12].x) * mw;
+  if (span < 10) return out;
+
+  const sx = ((lm[11].x + lm[12].x) / 2) * mw;
+  const sy = ((lm[11].y + lm[12].y) / 2) * mh;
+  const step = span * 0.03;
+
+  out.chest = widthAround(data, mw, mh, sx, sy + span * 0.45, step) ?? undefined;
+
+  const hipsOk = (lm[23].visibility ?? 0) > 0.6 && (lm[24].visibility ?? 0) > 0.6;
+  if (hipsOk) {
+    const hx = ((lm[23].x + lm[24].x) / 2) * mw;
+    const hy = ((lm[23].y + lm[24].y) / 2) * mh;
+    const at = (t: number) => ({ cx: sx + t * (hx - sx), y: sy + t * (hy - sy) });
+    const w = at(0.65); // navel / stomach level
+    out.waist = widthAround(data, mw, mh, w.cx, w.y, step) ?? undefined;
+    const h = at(1.12); // widest part of the hips
+    out.hip = widthAround(data, mw, mh, h.cx, h.y, step) ?? undefined;
+  }
+  return out;
+}
+
+let hemCanvas: HTMLCanvasElement | null = null;
+
+/**
+ * Worn-garment hem: walk down the left leg line (hip -> ankle/knee) and find the
+ * strongest colour edge. HEURISTIC: works best when the garment colour differs from
+ * skin / shoes / trousers. Returns a fraction of the frame height, or null.
+ */
+function detectHem(video: HTMLVideoElement, lm: LM[]): number | null {
+  const vis = (i: number) => lm[i]?.visibility ?? 0;
+  if (vis(23) < 0.6 || vis(24) < 0.6) return null;
+  const end = vis(27) >= 0.5 ? 27 : vis(25) >= 0.5 ? 25 : -1;
+  if (end < 0) return null;
+
+  const W = 160;
+  const H = Math.max(1, Math.round((W * (video.videoHeight || 720)) / (video.videoWidth || 1280)));
+  if (!hemCanvas) hemCanvas = document.createElement('canvas');
+  hemCanvas.width = W;
+  hemCanvas.height = H;
+  const ctx = hemCanvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return null;
+  ctx.drawImage(video, 0, 0, W, H);
+  const img = ctx.getImageData(0, 0, W, H).data;
+
+  const x0 = lm[23].x * W;
+  const y0 = lm[23].y * H;
+  const x1 = lm[end].x * W;
+  const y1 = lm[end].y * H;
+  const n = Math.floor(y1 - y0);
+  if (n < 20) return null;
+
+  const rows: number[][] = [];
+  for (let i = 0; i < n; i++) {
+    const x = Math.round(x0 + (x1 - x0) * (i / n));
+    const y = Math.round(y0 + i);
+    if (x < 2 || x >= W - 2 || y < 0 || y >= H) return null;
+    let r = 0;
+    let g = 0;
+    let b = 0;
+    for (let dx = -1; dx <= 1; dx++) {
+      const p = (y * W + x + dx) * 4;
+      r += img[p];
+      g += img[p + 1];
+      b += img[p + 2];
+    }
+    rows.push([r / 3, g / 3, b / 3]);
+  }
+  const mean = (a: number, b: number) => {
+    const s = [0, 0, 0];
+    for (let i = a; i < b; i++) for (let c = 0; c < 3; c++) s[c] += rows[i][c];
+    return s.map((v) => v / (b - a));
+  };
+  let best = 0;
+  let bi = -1;
+  for (let i = Math.floor(n * 0.25); i <= n - 4; i++) {
+    const up = mean(i - 4, i);
+    const dn = mean(i, i + 4);
+    const d = Math.hypot(up[0] - dn[0], up[1] - dn[1], up[2] - dn[2]);
+    if (d > best) {
+      best = d;
+      bi = i;
+    }
+  }
+  return best >= 45 && bi >= 0 ? (y0 + bi) / H : null;
+}
+
 // ── Hook ─────────────────────────────────────────────────────────────────────
 
 export function useLiveAR(
   videoRef: RefObject<HTMLVideoElement>,
   arCanvasRef: RefObject<HTMLCanvasElement>,
   selectedProduct: Product | null,
-
   isARActive: boolean,
   showSkeleton: boolean = true,
-  renderMode: RenderMode = '3d'
+  renderMode: RenderMode = '3d',
+  onFrame?: (frame: TrackingFrame, extra?: FrameExtra) => void,
+  /** Turn the body-segmentation mask on (costs FPS) only while it is needed. */
+  needSilhouette: boolean = false
 ): LiveARState {
   const [state, setState] = useState<LiveARState>({
     trackingState: 'initializing',
@@ -165,6 +303,10 @@ export function useLiveAR(
 
   const garmentStatusRef = useRef<GarmentStatus>('none');
 
+  // Always-latest onFrame callback (avoids restarting the loop when it changes)
+  const onFrameRef = useRef(onFrame);
+  onFrameRef.current = onFrame;
+
   // Track the last loaded product id to avoid reloading the same product
   const loadedProductIdRef = useRef<string | null>(null);
 
@@ -196,7 +338,6 @@ export function useLiveAR(
     rendererRef.current?.setShowSkeleton(showSkeleton);
   }, [showSkeleton, renderMode]);
 
-
   // ── Initialize MediaPipe PoseLandmarker ───────────────────────────────
   useEffect(() => {
     let cancelled = false;
@@ -222,13 +363,12 @@ export function useLiveAR(
                 minPoseDetectionConfidence: DETECTION_THRESHOLD,
                 minPosePresenceConfidence: PRESENCE_THRESHOLD,
                 minTrackingConfidence: TRACKING_THRESHOLD,
-                outputSegmentationMasks: false, // unused → big FPS win
+                outputSegmentationMasks: false, // switched on at runtime only when needed
               });
 
             try {
               landmarker = await make('GPU');
               console.log(`[MIRAI][AR] PoseLandmarker ready (GPU) from ${WASM_SOURCES[i]}`);
-
             } catch (gpuErr) {
               console.warn('[MIRAI][AR] GPU delegate failed, trying CPU:', gpuErr);
               landmarker = await make('CPU');
@@ -261,7 +401,6 @@ export function useLiveAR(
           ...s,
           isLoading: false,
           isReady: false,
-
           loadError:
             'Pose tracking unavailable. Check that /public/mediapipe contains the wasm folder and pose_landmarker_lite.task.',
           trackingState: 'error',
@@ -274,6 +413,15 @@ export function useLiveAR(
       cancelled = true;
     };
   }, []);
+
+  // ── Turn the segmentation mask on/off at runtime (used for clothing / waist) ──
+  useEffect(() => {
+    try {
+      landmarkerRef.current?.setOptions({ outputSegmentationMasks: needSilhouette });
+    } catch (err) {
+      console.warn('[MIRAI][AR] could not toggle segmentation mask:', err);
+    }
+  }, [needSilhouette, state.isReady]);
 
   // ── Load garment when selected product changes ────────────────────────
   useEffect(() => {
@@ -293,7 +441,6 @@ export function useLiveAR(
     loadedProductIdRef.current = productId;
     setGarmentStatus('loading');
     console.log('[MIRAI][AR] Loading garment for product:', productId);
-
 
     renderer
       .loadProduct(selectedProduct)
@@ -328,7 +475,6 @@ export function useLiveAR(
       // Always re-request the next frame first so loop keeps going even on error
       rafRef.current = requestAnimationFrame(tick);
 
-
       if (!video || !canvas || !landmarker || !renderer) return;
       if (video.readyState < 2) return; // HAVE_CURRENT_DATA
 
@@ -360,9 +506,35 @@ export function useLiveAR(
         landmarks: [],
       };
 
-
       try {
         const result = landmarker.detectForVideo(video, timestamp);
+        const extra: FrameExtra = {};
+
+        // 3D world landmarks (metres, hip-centred): cheap, always sent
+        const w3 = result.worldLandmarks?.[0];
+        if (w3) {
+          extra.world = w3.map((p: { x: number; y: number; z: number }) => ({
+            x: p.x,
+            y: p.y,
+            z: p.z,
+          }));
+        }
+
+        // Silhouette widths + worn-garment hem (only when the mask is switched on)
+        const masks = result.segmentationMasks;
+        if (masks && masks.length) {
+          try {
+            if (result.landmarks && result.landmarks.length > 0) {
+              extra.widths = measureBodyWidths(masks[0], result.landmarks[0]);
+              const hem = detectHem(video, result.landmarks[0]);
+              if (hem !== null) extra.hemYNorm = hem;
+            }
+          } catch {
+            /* ignore: silhouette is optional */
+          }
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          masks.forEach((m: any) => m.close?.());
+        }
 
         if (result.landmarks && result.landmarks.length > 0) {
           const rawLandmarks = result.landmarks[0];
@@ -393,10 +565,12 @@ export function useLiveAR(
           };
           lastTrackedAtRef.current = Date.now();
         } else {
-
           const elapsed = Date.now() - lastTrackedAtRef.current;
           trackingFrame.tracking_state = elapsed > 1500 ? 'lost' : 'searching';
         }
+
+        // ── Share the raw frame with listeners (body-size scan) ──────
+        onFrameRef.current?.(trackingFrame, extra);
 
         // ── Render garment / skeleton ────────────────────────────────
         if (isARActive) {
@@ -426,7 +600,6 @@ export function useLiveAR(
           garment: garmentStatusRef.current,
           tracking: trackingFrame.tracking_state,
           confidence: Math.round(trackingFrame.confidence * 100) / 100,
-
           landmarks: trackingFrame.landmarks.length,
           shoulders: [vis(11), vis(12)],
           hips: [vis(23), vis(24)],
@@ -459,7 +632,6 @@ export function useLiveAR(
     }
 
     rafRef.current = requestAnimationFrame(tick);
-
   }, [videoRef, arCanvasRef, isARActive, selectedProduct, showSkeleton]);
 
   const stopLoop = useCallback(() => {

@@ -9,6 +9,15 @@
  *   2. Mirai KVGE (Proprietary Self-Hosted Edge Engine)
  *      Webcam MediaStream ──► MediaPipe WASM ──► 3D (Three.js) or 2D mesh-warp garment (60 FPS)
  *
+ * UPDATE (measurements v2):
+ *   - Weight input is passed to the scan panel (improves stomach / chest / hip estimates).
+ *   - The segmentation mask stays on (scan.wantsSilhouette) until the waist width is measured.
+ *
+ * UPDATE (size scan):
+ *   - Body scan panel (height -> measurements) + automatic size recommendation.
+ *   - useLiveAR passes every tracking frame to the scan via the new `onFrame` argument.
+ *   - ProductDetailCard shows BEST FIT; the recommended size is auto-selected.
+ *
  * UPDATE (3D + camera):
  *   - 2D / 3D renderer toggle in the header (3D default).
  *   - Camera picker (when >1 camera), specific camera error messages, robust retry.
@@ -26,15 +35,18 @@
  * Layer order: local camera (z-0) < Decart stream (z-[1]) < AR canvas (z-10) < HUD (z-20+).
  */
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useCamera } from '../hooks/useCamera';
 import { useProducts } from '../hooks/useProducts';
 import { useLiveAR } from '../hooks/useLiveAR';
+import { useBodyMeasurements } from '../hooks/useBodyMeasurements';
 
 import { useTryOn } from '../hooks/useTryOn';
 import { useDecartVTO } from '../hooks/useDecartVTO';
 import { ProductCatalog } from './ProductCatalog';
 import { ProductDetailCard } from './ProductDetailCard';
+import { BodyScanPanel } from './BodyScanPanel';
+import { MeasurementOverlay } from './MeasurementOverlay';
 import { SaveLookModal } from './SaveLookModal';
 import { CouponsModal } from './CouponsModal';
 import { TryOnOverlay } from './TryOnOverlay';
@@ -42,6 +54,7 @@ import { VTOProviderModal } from './VTOProviderModal';
 import type { Product } from '../types/api';
 import type { VTOProviderType } from '../services/vto/types';
 import { isLiveVTOAvailable } from '../services/GarmentRegistry';
+import { recommendSize } from '../sizing/sizeChart';
 import { Activity, Eye, EyeOff, Tag, LogOut, Zap, Shield, Cpu, Box, Layers } from 'lucide-react';
 import type { RenderMode } from '../rendering/garmentRenderer';
 
@@ -63,7 +76,6 @@ export const MirrorView: React.FC = () => {
     errorDetail: cameraErrorDetail,
     devices: cameraDevices,
     activeDeviceId: activeCameraId,
-
     startCamera,
     switchCamera,
     captureFrame,
@@ -96,7 +108,6 @@ export const MirrorView: React.FC = () => {
   // ── Product Catalog ────────────────────────────────────────────────────────
   const {
     categories,
-
     products,
     activeCategoryId,
     loading: catalogLoading,
@@ -129,7 +140,6 @@ export const MirrorView: React.FC = () => {
       streamId: decartRemoteStream.id,
       videoTracks: decartRemoteStream.getVideoTracks().map((t) => ({
         id: t.id,
-
         enabled: t.enabled,
         muted: t.muted,
         readyState: t.readyState,
@@ -162,13 +172,15 @@ export const MirrorView: React.FC = () => {
     decartRemoteStream.getVideoTracks().forEach((track) => {
       track.onunmute = () => {
         console.log('[MIRAI] Decart video track unmuted, frames arriving!');
-
         playRemoteVideo();
       };
     });
 
     playRemoteVideo();
   }, [decartRemoteStream]);
+
+  // ── Body Size Scan (height + weight -> measurements -> size recommendation) ─
+  const scan = useBodyMeasurements();
 
   // ── Live AR Virtual Try-On Engine (Mirai Self-Hosted KVGE) ─────────────────
   const arCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -190,12 +202,31 @@ export const MirrorView: React.FC = () => {
     selectedProduct,
     isKVGEMeshActive,
     showSkeleton,
-    renderMode
+    renderMode,
+    scan.feedFrame, // every tracking frame goes to the size scan
+    scan.wantsSilhouette // mask stays on until the waist width is measured (saves FPS afterwards)
   );
+
+  // Recommended size for the selected product (tops only), from the finished scan
+  const rec = useMemo(
+    () =>
+      selectedProduct && scan.measurements
+        ? recommendSize(
+            selectedProduct.category_id,
+            selectedProduct.sizes,
+            scan.measurements.chestCm
+          )
+        : null,
+    [selectedProduct, scan.measurements]
+  );
+
+  // Auto-select the recommended size (also when the user picks a different product)
+  useEffect(() => {
+    if (rec) setSelectedSize(rec.size);
+  }, [rec?.size, selectedProduct?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Modals & Dialogs ───────────────────────────────────────────────────────
   const [isSaveLookOpen, setIsSaveLookOpen] = useState<boolean>(false);
-
   const [isCouponsOpen, setIsCouponsOpen] = useState<boolean>(false);
 
   // ── AI Photo Snapshot Try-On (Secondary Feature) ───────────────────────────
@@ -228,7 +259,6 @@ export const MirrorView: React.FC = () => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-
           session_id: sessionId,
           event_type: 'garment_selected',
           product_id: product.id,
@@ -261,7 +291,6 @@ export const MirrorView: React.FC = () => {
           return;
         }
 
-
         if (decartState === 'connected') {
           await changeDecartGarment(product);
         } else {
@@ -293,7 +322,6 @@ export const MirrorView: React.FC = () => {
         }
 
         setActiveProvider('decart');
-
 
         if (selectedProduct) {
           const stream =
@@ -328,12 +356,12 @@ export const MirrorView: React.FC = () => {
       method: 'POST',
     }).catch(() => {});
 
-
     stopDecartSession();
     setSelectedProduct(null);
     setIsARActive(true);
+    scan.reset(); // clear the previous customer's measurements
     setSessionId(`sess_${Math.random().toString(36).substring(2, 9)}`);
-  }, [sessionId, stopDecartSession]);
+  }, [sessionId, stopDecartSession, scan.reset]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── AI Photo Try-On Handlers ───────────────────────────────────────────────
   const handlePhotoTryOn = useCallback(async () => {
@@ -393,7 +421,6 @@ export const MirrorView: React.FC = () => {
                 onChange={(e) => switchCamera(e.target.value)}
                 className="mt-4 px-3 py-2 rounded-lg bg-white/10 text-white text-sm border border-white/20 max-w-sm"
               >
-
                 {cameraDevices.map((d) => (
                   <option key={d.deviceId} value={d.deviceId} className="text-black">
                     {d.label}
@@ -426,7 +453,6 @@ export const MirrorView: React.FC = () => {
               autoPlay
               playsInline
               muted
-
               className={`w-full h-full object-cover absolute inset-0 z-[1] transition-opacity duration-300 ${
                 isDecartLive ? 'opacity-100' : 'opacity-0 pointer-events-none'
               }`}
@@ -450,6 +476,15 @@ export const MirrorView: React.FC = () => {
         style={MIRROR_AR_CANVAS ? { transform: 'scaleX(-1)' } : undefined}
       />
 
+      {/* ── Layer 2B: Skeleton + measurement lines (shoulders, chest, torso, height) ── */}
+      {!isPhotoOverlayOpen && (
+        <MeasurementOverlay
+          frameRef={scan.latestFrame}
+          measurements={scan.measurements}
+          status={scan.status}
+        />
+      )}
+
       {/* ── Layer 3: Enterprise Retail HUD Header Bar ── */}
       {!isPhotoOverlayOpen && (
         <header className="absolute top-0 left-0 right-0 z-20 flex justify-between items-center mx-4 mt-4 px-5 py-3 bg-black/80 backdrop-blur-2xl rounded-2xl border border-white/10 shadow-2xl">
@@ -459,7 +494,6 @@ export const MirrorView: React.FC = () => {
               <span className="px-2 py-0.5 rounded-full bg-violet-500/20 border border-violet-500/40 text-violet-300 text-[10px] font-bold">
                 5G SMART TRIAL ROOM
               </span>
-
             </div>
             <p className="text-[11px] text-neutral-400 tracking-wider">OCTACEPT • Intelligent Mirror</p>
           </div>
@@ -492,7 +526,6 @@ export const MirrorView: React.FC = () => {
                       : decartState === 'connecting'
                       ? 'DECART: CONNECTING...'
                       : 'DECART VTO: PROTOTYPE'}
-
                   </span>
                   <span className="text-[9px] text-amber-300 font-bold px-1.5 py-0.5 rounded bg-amber-500/20">
                     TEMP
@@ -525,7 +558,6 @@ export const MirrorView: React.FC = () => {
             >
               <Cpu size={13} className="text-violet-400" />
               <span>Engine</span>
-
             </button>
 
             {/* Skeleton Overlay Toggle */}
@@ -557,7 +589,6 @@ export const MirrorView: React.FC = () => {
                 ))}
               </select>
             )}
-
 
             {/* 2D / 3D Garment Renderer Toggle */}
             <button
@@ -591,7 +622,6 @@ export const MirrorView: React.FC = () => {
             {/* End Session Button */}
             <button
               onClick={handleEndSession}
-
               title="End session and reset mirror for next customer"
               className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold bg-white/5 hover:bg-red-500/20 text-neutral-400 hover:text-red-300 border border-white/10 hover:border-red-500/30 transition-all active:scale-95"
             >
@@ -624,6 +654,24 @@ export const MirrorView: React.FC = () => {
         </div>
       )}
 
+      {/* ── Layer 3B: Body Size Scan Panel (left side, below the header) ── */}
+      {!isPhotoOverlayOpen && (
+        <BodyScanPanel
+          status={scan.status}
+          progress={scan.progress}
+          hint={scan.hint}
+          measurements={scan.measurements}
+          heightCm={scan.heightCm}
+          onHeightChange={scan.setHeight}
+          weightKg={scan.weightKg}
+          onWeightChange={scan.setWeight}
+          clothingChoice={scan.clothingChoice}
+          onClothingChange={scan.setClothing}
+          calibrated={scan.calibrated}
+          onCalibrate={scan.calibrate}
+          onClearCalibration={scan.clearCalibration}
+        />
+      )}
 
       {/* ── Layer 4: Contextual Product Details, Sizes & In-Store Inventory ── */}
       {!isPhotoOverlayOpen && selectedProduct && (
@@ -634,6 +682,8 @@ export const MirrorView: React.FC = () => {
           onSaveLook={() => setIsSaveLookOpen(true)}
           onOpenCoupons={() => setIsCouponsOpen(true)}
           onClear={handleClearSelection}
+          recommendedSize={rec?.size ?? null}
+          alternateSize={rec?.alternate ?? null}
         />
       )}
 
@@ -657,7 +707,6 @@ export const MirrorView: React.FC = () => {
       {/* ── Layer 6: Save Look & Real QR Code Handoff Modal ── */}
       <SaveLookModal
         isOpen={isSaveLookOpen}
-
         onClose={() => setIsSaveLookOpen(false)}
         product={selectedProduct}
         selectedSize={selectedSize}
@@ -690,7 +739,6 @@ export const MirrorView: React.FC = () => {
         onClose={() => setIsProviderModalOpen(false)}
         activeProvider={activeProvider}
         onSelectProvider={handleSelectProvider}
-
         decartState={decartState}
         decartApiKey={decartApiKey}
         onSaveApiKey={setDecartApiKey}

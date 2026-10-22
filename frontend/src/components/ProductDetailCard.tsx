@@ -3,6 +3,8 @@
  *
  * Floating contextual retail card displaying the active garment's pricing,
  * physical in-store rack location, interactive size selector, and action buttons.
+ *
+ * UPDATE: shows a BEST FIT tag + recommendation text from the body scan.
  */
 
 import React, { useState, useEffect } from 'react';
@@ -16,6 +18,10 @@ interface ProductDetailCardProps {
   onSaveLook: () => void;
   onOpenCoupons: () => void;
   onClear: () => void;
+  /** Size recommended from the body scan (null if no scan / not a top). */
+  recommendedSize?: string | null;
+  /** Second-best size when the user is between two sizes. */
+  alternateSize?: string | null;
 }
 
 export const ProductDetailCard: React.FC<ProductDetailCardProps> = ({
@@ -25,6 +31,8 @@ export const ProductDetailCard: React.FC<ProductDetailCardProps> = ({
   onSaveLook,
   onOpenCoupons,
   onClear,
+  recommendedSize = null,
+  alternateSize = null,
 }) => {
   const [inventory, setInventory] = useState<InventoryStatus | null>(null);
 
@@ -131,10 +139,28 @@ export const ProductDetailCard: React.FC<ProductDetailCardProps> = ({
                 }`}
               >
                 {size}
+                {size === recommendedSize && (
+                  <span className="block text-[8px] text-emerald-300 leading-none mt-0.5">
+                    BEST FIT
+                  </span>
+                )}
               </button>
             );
           })}
         </div>
+
+        {recommendedSize && (
+          <p className="mt-2 text-[11px] text-emerald-400">
+            Based on your measurements, we recommend <b>{recommendedSize}</b>
+            {alternateSize && (
+              <>
+                {' '}
+                (or <b>{alternateSize}</b> for a different fit)
+              </>
+            )}
+            .
+          </p>
+        )}
       </div>
 
       {/* Physical Store Location */}
