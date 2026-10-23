@@ -1,10 +1,10 @@
 import React from 'react';
-import { MirrorView } from './components/MirrorView';
+import { AppShell } from './AppShell';
 
 export const App: React.FC = () => {
   return (
     <div className="w-screen h-screen overflow-hidden bg-black">
-      <MirrorView />
+      <AppShell />
     </div>
   );
 };

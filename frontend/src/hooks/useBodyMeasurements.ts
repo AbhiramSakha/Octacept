@@ -22,7 +22,7 @@
  * Silhouette widths are only used when the arms are raised slightly (A-pose),
  * otherwise the arms merge with the torso and inflate the width.
  */
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { TrackingFrame } from '../types/tracking';
 import { CHEST_CM, sizeFromChest } from '../sizing/sizeChart';
 
@@ -74,7 +74,10 @@ const WINDOW = 45;
 const MIN_SAMPLES = 30;
 const MIN_OPTIONAL = 5; // samples needed for optional measurements
 const UPDATE_EVERY = 10;
-const LOST_MS = 2000;
+const LOST_MS = 2500; // no valid frame for this long -> drop the old result
+const PUBLISH_MS = 400; // max UI update rate once ready (stops re-render storms)
+const STABLE_CV = 0.04; // shoulder jitter allowed before a scan counts as 'steady'
+const SIL_MAX_MS = 20000; // silhouette mask never stays on longer than this
 const MIN_VIS = 0.6;
 const LIMB_VIS = 0.5;
 const FACE_VIS = 0.5;
@@ -175,7 +178,14 @@ export function useBodyMeasurements(initialHeightCm: number = DEFAULT_HEIGHT_CM)
   const samples = useRef<Sample[]>([]);
   const held = useRef<Partial<Record<Key, number>>>({}); // last good silhouette values
   const ratios = useRef<number[]>([]);
-  const lastSeen = useRef(0);
+  const lastGood = useRef(0); // last time a frame produced a valid sample
+  const lastProgress = useRef(0);
+  const lastPublish = useRef(0);
+  const lastJson = useRef('');
+  const outlierHist = useRef<boolean[]>([]);
+  const silRef = useRef(false);
+  const silTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [wantsSilhouette, setWantsSilhouette] = useState(false);
   const sinceUpdate = useRef(0);
   const outlierRun = useRef(0);
   const lastRawChest = useRef<number | null>(null);
@@ -194,6 +204,28 @@ export function useBodyMeasurements(initialHeightCm: number = DEFAULT_HEIGHT_CM)
       setStatus(s);
     }
   };
+  /** Segmentation mask on/off with a hard time limit, so it can never stay on (and slow the app) forever. */
+  const setSilhouette = (on: boolean) => {
+    if (silRef.current === on) return;
+    silRef.current = on;
+    setWantsSilhouette(on);
+    if (silTimer.current) {
+      clearTimeout(silTimer.current);
+      silTimer.current = null;
+    }
+    if (on) {
+      silTimer.current = setTimeout(() => {
+        silRef.current = false;
+        setWantsSilhouette(false);
+      }, SIL_MAX_MS);
+    }
+  };
+  useEffect(
+    () => () => {
+      if (silTimer.current) clearTimeout(silTimer.current);
+    },
+    []
+  );
 
   const clearAll = useCallback(() => {
     samples.current = [];
@@ -201,6 +233,12 @@ export function useBodyMeasurements(initialHeightCm: number = DEFAULT_HEIGHT_CM)
     ratios.current = [];
     sinceUpdate.current = 0;
     outlierRun.current = 0;
+    outlierHist.current = [];
+    lastProgress.current = 0;
+    lastJson.current = '';
+    lastPublish.current = 0;
+    lastRawChest.current = null;
+    setSilhouette(false);
     methodRef.current = null;
     statusRef.current = 'waiting';
     lastHint.current = 'Step in front of the mirror';
@@ -255,12 +293,14 @@ export function useBodyMeasurements(initialHeightCm: number = DEFAULT_HEIGHT_CM)
     const now = Date.now();
     const lm = f.landmarks;
 
+    // Watchdog: no valid frame for LOST_MS (person left, or the model only hallucinates
+    // low-confidence landmarks) -> drop the old result instead of showing it forever.
+    if (samples.current.length && now - lastGood.current > LOST_MS) clearAll();
+
     if (lm.length < 33) {
-      if (samples.current.length && now - lastSeen.current > LOST_MS) clearAll();
-      else if (!samples.current.length) setHintOnce('Step in front of the mirror');
+      if (!samples.current.length) setHintOnce('Step in front of the mirror');
       return;
     }
-    lastSeen.current = now;
 
     const vis = (i: number) => lm[i]?.visibility ?? 0;
     if (vis(11) < MIN_VIS || vis(12) < MIN_VIS) return setHintOnce('Show your shoulders to the camera');
@@ -307,18 +347,23 @@ export function useBodyMeasurements(initialHeightCm: number = DEFAULT_HEIGHT_CM)
     // Different person?
     if (samples.current.length >= 10) {
       const med = median(samples.current.map((s) => s.shoulder as number));
-      if (Math.abs(shoulderCm - med) / med > 0.15) {
-        outlierRun.current++;
-        if (outlierRun.current < 8) return;
+      // Sliding window (not a consecutive counter): alternating good/bad frames can no longer
+      // keep an old wrong median alive forever.
+      const isOut = Math.abs(shoulderCm - med) / med > 0.15;
+      outlierHist.current.push(isOut);
+      if (outlierHist.current.length > 20) outlierHist.current.shift();
+      if (isOut) {
+        if (outlierHist.current.filter(Boolean).length < 12) return;
         samples.current = [];
         held.current = {};
         ratios.current = [];
         sinceUpdate.current = 0;
         outlierRun.current = 0;
+        outlierHist.current = [];
+        lastProgress.current = 0;
+        setSilhouette(true);
         setStatusOnce('measuring');
         setProgress(0);
-      } else {
-        outlierRun.current = 0;
       }
     }
 
@@ -380,6 +425,7 @@ export function useBodyMeasurements(initialHeightCm: number = DEFAULT_HEIGHT_CM)
       if (hemY > shY) garmentLen = (hemY - shY) / pxPerCm;
     }
 
+    lastGood.current = now;
     samples.current.push({
       shoulder: shoulderCm,
       torso,
@@ -396,11 +442,28 @@ export function useBodyMeasurements(initialHeightCm: number = DEFAULT_HEIGHT_CM)
 
     const n = samples.current.length;
     if (n < MIN_SAMPLES) {
+      if (statusRef.current === 'waiting') setSilhouette(true);
       setStatusOnce('measuring');
-      setProgress(Math.round((n / MIN_SAMPLES) * 100) / 100);
+      // update the bar in 5% steps only (was: a React re-render on EVERY frame)
+      const p = Math.round((n / MIN_SAMPLES) * 20) / 20;
+      if (p !== lastProgress.current) {
+        lastProgress.current = p;
+        setProgress(p);
+      }
       return setHintOnce(
         armsClear ? 'Hold still, measuring…' : 'Raise your arms slightly away from your body'
       );
+    }
+
+    // Steadiness gate: do not publish a result while the person is still moving.
+    if (statusRef.current !== 'ready') {
+      const sh = samples.current.map((s) => s.shoulder as number);
+      const mean = sh.reduce((a, b) => a + b, 0) / n;
+      const sd = Math.sqrt(sh.reduce((a, b) => a + (b - mean) ** 2, 0) / n);
+      if (sd / mean > STABLE_CV) {
+        setStatusOnce('measuring');
+        return setHintOnce('Hold still, measuring…');
+      }
     }
 
     if (statusRef.current !== 'ready' || sinceUpdate.current >= UPDATE_EVERY) {
@@ -449,7 +512,7 @@ export function useBodyMeasurements(initialHeightCm: number = DEFAULT_HEIGHT_CM)
       const legCm = pick('leg');
       const orNull = (v: number | null) => (v === null ? null : r1(v));
 
-      setMeasurements({
+      const next: BodyMeasurements = {
         heightCm: h,
         weightKg: w,
         bmi: bmi ? r1(bmi) : null,
@@ -470,18 +533,29 @@ export function useBodyMeasurements(initialHeightCm: number = DEFAULT_HEIGHT_CM)
         method,
         clothing,
         clothingAuto: auto,
-      });
+      };
+      // Publish only when something changed, and at most every PUBLISH_MS once ready.
+      const json = JSON.stringify(next);
+      if (
+        json !== lastJson.current &&
+        (statusRef.current !== 'ready' || now - lastPublish.current >= PUBLISH_MS)
+      ) {
+        lastJson.current = json;
+        lastPublish.current = now;
+        setMeasurements(next);
+      }
+      lastProgress.current = 1;
       setProgress(1);
       setStatusOnce('ready');
+      if (next.waistCm !== null) setSilhouette(false); // waist known -> mask no longer needed
     }
     setHintOnce(armsClear ? '' : 'Raise your arms slightly away from your body for waist width');
   }, [clearAll]);
 
   const calibrated = measurements ? scales[measurements.method] !== 1 : false;
 
-  /** Keep the (costly) segmentation mask on until the waist width is known. */
-  const wantsSilhouette =
-    status === 'measuring' || (status === 'ready' && measurements !== null && measurements.waistCm === null);
+  // wantsSilhouette (state above): mask is on while measuring, off once the waist is known
+  // or after SIL_MAX_MS, whichever comes first.
 
   return {
     status,

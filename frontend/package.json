@@ -13,6 +13,7 @@
     "@mediapipe/tasks-vision": "^0.10.14",
     "@types/three": "^0.186.0",
     "lucide-react": "^0.344.0",
+    "qrcode": "^1.5.4",
     "qrcode.react": "^4.2.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
@@ -20,6 +21,7 @@
   },
   "devDependencies": {
     "@types/node": "^26.6.4",
+    "@types/qrcode": "^1.5.6",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.0",
